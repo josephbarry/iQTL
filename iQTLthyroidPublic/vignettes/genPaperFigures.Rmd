@@ -1,0 +1,628 @@
+---
+title: "Automatic generation of paper figures"
+author: "Joseph Barry"
+output: 
+    html_document:
+        toc: true
+        theme: united
+---
+<!--
+%\VignetteEngine{knitr::rmarkdown}
+%\VignetteIndexEntry{Supplementary Materials - paper figures}
+-->
+
+```{r setup, include=FALSE}
+library(knitr)
+opts_chunk$set(fig.path="fig/", warning=FALSE, fig.align="center", fig.show="hold", fig.width=6, fig.height=6, message=FALSE, out.extra='style=""', dpi=300, fig.ext='pdf', dev='pdf')
+```
+
+Load required packages.
+
+```{r loadPackages}
+library(MASS)
+library(IHW)
+library(iQTLthyroidPublic)
+library(ComplexHeatmap)
+library(ggplot2)
+library(ROCR)
+theme_set(theme_classic(base_size=24))
+```
+
+## Processing of Raw Textural Feature Matrix
+
+```{r loadFeatureTable}
+data("featTable")
+dim(ft)
+```
+
+After image processing and feature extraction, the feature matrix consisted of 702 identified tissue pieces. Some were too small to give reliable estimates for tissue texture, and were removed.
+
+```{r rmSmallTissuePieces}
+ft$uid <- paste(ft$PlateName, ft$pieceID, sep=".")
+a0 <- 20
+ggplot(ft, aes(log2(s.area)))+geom_histogram(binwidth=0.1)+geom_vline(xintercept=a0, linetype="dashed")+xlab(expression(paste(log[2], "(tissue piece area)")))
+fts <- filter(ft, log2(s.area) > a0)
+dim(fts)
+nrow(ft)-nrow(fts)
+```
+
+Only textural features were considered for the subsequent analysis. In total there were 117 haralick textural features, corresponding to three color channels (RGB), times three haralick scales, times the thirteen standard haralick features.
+
+```{r subsetTexturalFeatures}
+ftNames <- grep("^[rgb].h", colnames(fts), value=TRUE)
+length(ftNames)
+```
+
+Most samples had several distinct tissue pieces. We obtained summarized feature values by taking the mean across tissue pieces.
+
+```{r summarizeAcrossPieces}
+y <- fts %>% group_by(PlateName) %>% summarise_at(funs(mean), .vars=ftNames) %>% ungroup
+dim(y)
+```
+
+## Feature Transformation and Visualization
+
+To obtain more symmetric feature distributions we next performed a logarithmic transformation. An example of the effect of this transformation is now shown.
+
+```{r logTransform}
+ggplot(y, aes(r.h.con.s10))+geom_histogram(binwidth=0.02)
+y[, ftNames] <- log2(y[, ftNames])
+ggplot(y, aes(r.h.con.s10))+geom_histogram(fill="blue", binwidth=0.02)
+```
+
+In preparation for the PCA fit, we Z-scored the data to ensure all features were on the same scale.
+
+```{r Z}
+Z <- function(x) (x-mean(x, na.rm=TRUE))/sd(x, na.rm=TRUE)
+ft.sd <- sapply(ftNames, function(ft) sd(y[[ft]], na.rm=TRUE))
+ft.mean <- sapply(ftNames, function(ft) mean(y[[ft]], na.rm=TRUE))
+y <- mutate_at(y, funs(Z), .vars=ftNames)
+```
+The processed feature matrix was then visualized.
+
+```{r featureHeatmap, fig.width=3.5, fig.height=4.5}
+M <- as.matrix(y[, ftNames])
+rownames(M) <- y$PlateName
+fSize <- 24
+Heatmap(M, show_column_names=FALSE, show_row_names=FALSE, show_heatmap_legend=FALSE, row_title="GTEx thyroid samples", column_title="Image features", row_title_gp=gpar(fontsize=fSize), column_title_gp=gpar(fontsize=fSize), column_title_side="bottom", row_title_side="left")
+```
+
+## Principal Component Analysis
+
+A PCA fit was performed at this stage. A small number of values contained NAs, and were set to zero. Since our feature distributions were zero-centered at this stage, we set the NAs to zero to avoid errors in the PCA fit.
+
+```{r pcaFit}
+sum(is.na(M))
+M[is.na(M)] <- 0
+pca <- prcomp(M, scale=FALSE)
+pcaPercentVar <- 100*cumsum(pca$sdev^2/sum(pca$sdev^2))[1:10]
+print(pcaPercentVar, digits=2)
+ggplot(data.frame(x=factor(1:10), y=pcaPercentVar), aes(x=x, y=y))+geom_point()+xlab("Principal Component")+ylab("Percentage of variance")+ylim(c(0, 100))
+```
+
+We saw that the first two principal components explained 73% of the variance.  
+
+```{r loadings}
+df <- as.data.frame(pca$rotation[, 1:2])
+df$label <- rownames(df)
+df <- arrange(df, PC2)
+df$channel <- sapply(df$label, function(x) strsplit(x, split="\\.")[[1]][1])
+df$channel <- factor(df$channel, levels=c("r", "g", "b"))
+df$index <- seq_len(nrow(df))
+df %>% arrange(desc(abs(PC2))) %>% head
+dfs <- df %>% group_by(channel) %>% summarize(channel.loading=sum(abs(PC2)))
+100*dfs$channel.loading/sum(dfs$channel.loading)
+g <- ggplot(df, aes(index, PC2, fill=channel))+geom_bar(stat="identity")+scale_fill_manual(values=c("red", "green", "blue"))+ylab("Image PC2 loadings")+xlab("Haralick Features")
+print(g)
+```
+
+## Associations with Clinical Metadata
+
+We determined Hashimoto's Thyroiditis status automatically from the comments of the GTEx pathologist who reviewed each sample. Some samples were described as being early-stage Hashimoto's disease, which we decided to categorize as Hashimoto's positive.
+
+For all analyses presented in the main text, age was specified in years. Here, to protect against re-identification, age is binned into decades.
+
+```{r covariatesHashi}
+data("covariates")
+cvrt$AGE <- cvrt$AGE.decade
+cvrt$hashimotos <- grepl("[Hh]ashimoto", cvrt$SMPTHNTS)
+sum(cvrt$hashimotos)
+cvrt$fibrotic <- grepl("[Ff]ibrosis", cvrt$SMPTHNTS) | grepl("[Ff]ibrotic", cvrt$SMPTHNTS)
+cvrt$hashiFibro <- cvrt$fibrotic & cvrt$hashimotos
+sum(cvrt$hashiFibro)
+S <- matrix(
+    data=c(N=(filter(cvrt, hashimotos)$fibrotic %>% sum),
+        n=(filter(cvrt, !hashimotos)$fibrotic %>% sum),
+        M=((!filter(cvrt, hashimotos)$fibrotic) %>% sum),
+        m=((!filter(cvrt, !hashimotos)$fibrotic) %>% sum)),
+    nrow=2)
+fisher.test(S)
+
+x <- as.data.frame(pca$x[, 1:3])
+x$sid <- rownames(pca$x)
+x <- left_join(x, dplyr::select(cvrt, ids, hashimotos, fibrotic, hashiFibro, gender, AGE), by=c("sid"="ids"))
+x <- arrange(x, desc(PC2))
+x[1:10, ]
+arrange(x, PC1)[1:10, ]
+```
+
+Next we plotted the first two principal components with sex indicated by the point type, and Hashimoto's Thyroiditis status by color.
+
+```{r pcaPlot}
+x <- arrange(x, hashimotos, hashiFibro)
+print(ggplot(x, aes(PC1, PC2, col=hashimotos, pch=gender))+geom_point(size=2)+scale_color_manual(values=c("grey", "blue"))+guides(col=FALSE, pch=FALSE)+xlab("Image PC1")+ylab("Image PC2"))
+print(ggplot(x, aes(PC1, PC2, col=hashiFibro, pch=gender))+geom_point(size=2)+scale_color_manual(values=c("grey", "blue"))+guides(col=FALSE, pch=FALSE)+xlab("Image PC1")+ylab("Image PC2"))
+```
+
+We noticed that high values of PC2 were associated with Hashimoto's status.
+
+```{r pc2HashiBiomarker}
+pred <- prediction(predictions=x$PC2, labels=x$hashimotos)
+perf <- performance(pred, "tpr", "fpr")
+df <- data.frame(fpr=perf@x.values[[1]], tpr=perf@y.values[[1]], stringsAsFactors=FALSE)
+auc <- performance(pred, "auc")
+aucLab <- paste("AUC", round(auc@y.values[[1]], digits=2))
+print(aucLab)
+fSize=24*5/3
+ggplot(df, aes(fpr, tpr))+geom_line(col="blue", lwd=1.5)+
+    xlab("False positive rate")+ylab("True positive rate")+
+    theme_classic(base_size=fSize)+
+    scale_x_continuous(breaks=c(0, 0.25, 0.5, 0.75, 1), labels=c("0", "", 0.5, "", 1))+
+    scale_y_continuous(breaks=c(0, 0.25, 0.5, 0.75, 1), labels=c("0", "", 0.5, "", 1))
+```
+
+Is the first PEER factor also a performant HT biomarker?
+
+```{r peer1HashiBiomarker}
+data("peerFactors")
+peerFactors <- as.data.frame(peerFactors, stringsAsFactors=FALSE)
+peerFactors$sid <- rownames(peerFactors)
+peerFactors <- left_join(peerFactors, x, by=c("sid"="sid"))
+sapply(1:20, function(i) {
+cor(peerFactors[, paste0("PEER", i)], peerFactors$PC2, method="pearson")
+})
+pred <- prediction(predictions=peerFactors$PEER1, labels=peerFactors$hashimotos)
+perf <- performance(pred, "tpr", "fpr")
+df <- data.frame(fpr=perf@x.values[[1]], tpr=perf@y.values[[1]], stringsAsFactors=FALSE)
+auc <- performance(pred, "auc")
+aucLab <- paste("AUC", round(auc@y.values[[1]], digits=2))
+print(aucLab)
+ggplot(df, aes(fpr, tpr))+geom_line(col="blue", lwd=1.5)+
+    xlab("False positive rate")+ylab("True positive rate")+
+    scale_x_continuous(breaks=c(0, 0.25, 0.5, 0.75, 1), labels=c("0", "", 0.5, "", 1))+
+    scale_y_continuous(breaks=c(0, 0.25, 0.5, 0.75, 1), labels=c("0", "", 0.5, "", 1))
+```
+
+Next we tested if high values of PC2 were also more strongly associated with females than males, a clinical characteristic consistent with Hashimotos disease.
+
+```{r pc2Gender}
+xh <- left_join(x, y, by=c("sid"="PlateName"))
+xh$gender <- factor(xh$gender, levels=c("MALE", "FEMALE"))
+fit <- glm(hashimotos~PC2+gender+AGE, family="binomial", data=xh)
+fit2 <- glm(hashimotos~gender+AGE, family="binomial", data=xh)
+summary(fit)
+exp(coef(fit))
+summary(fit2)
+exp(coef(fit2))
+```
+
+## Gene Expression Analyses
+
+Having established PC2 as a biomarker for Hashimoto's disease, we obtained GTEx V6 gene expression data for the N=341 thyroid tissue samples included in our image-based analysis, to test which pathways were associated with the observed lymphocyte infiltration. Genes that were not detected in more than half of the samples were first removed (leaving N=23,993 genes), and quantile normalization was employed to ensure samples were comparable. Batch effects due to the differing type of RNA extraction methods were removed using limma.
+
+Gene expression was then regressed against PC1 and PC2, while correcting for gender, age, collection site, and tissue autolysis score.
+
+```{r pcGeneRegressionNoPEER}
+data("fitPCsNoPEER")
+sapply(fitPCsNoPEER, dim)
+for (i in seq_along(fitPCsNoPEER)) fitPCsNoPEER[[i]]$PC <- names(fitPCsNoPEER)[i]
+addRankN <- function(x) {x$rankN <- rank(x$pval)/nrow(x); x}
+fitPCsNoPEER <- lapply(fitPCsNoPEER, addRankN)
+fitPCsNoPEERGrouped <- do.call(rbind, fitPCsNoPEER)
+fitPCsNoPEERGrouped$PC <- factor(fitPCsNoPEERGrouped$PC, levels=c("PC2", "PC1"))
+expLab <- expression(paste(-log[10], "(", P[G], "), expected"))
+obsLab <- expression(paste(-log[10], "(", P[G], "), observed"))
+ggplot(fitPCsNoPEERGrouped, aes(-log10(rankN), -log10(pval), col=PC))+geom_line(lwd=1.5)+geom_abline(slope=1, intercept=0, linetype="dashed")+
+    guides(col=FALSE)+
+    xlab(expLab)+
+    ylab(obsLab)
+```
+
+```{r pcGeneRegression}
+data("fitPCs")
+sapply(fitPCs, dim)
+for (i in seq_along(fitPCs)) fitPCs[[i]]$PC <- names(fitPCs)[i]
+fitPCs <- lapply(fitPCs, addRankN)
+fitPCsGrouped <- do.call(rbind, fitPCs)
+fitPCsGrouped$PC <- factor(fitPCsGrouped$PC, levels=c("PC2", "PC1"))
+ggplot(fitPCsGrouped, aes(-log10(rankN), -log10(pval), col=PC))+geom_line(lwd=1.5)+geom_abline(slope=1, intercept=0, linetype="dashed")+
+    guides(col=FALSE)+
+    xlab(expLab)+
+    ylab(obsLab)
+```
+
+Consistent with the visual inspection of images, PC2 carried considerably more biological signal than PC1. The strength of association with PC2 indicated that lymphocyte infiltration is a major driver of expression variability in GTEx thyroid tissue.
+
+We arbitrarily selected a threshold of -log10(p)>10 to obtain a candidate list of the genes most associated with PC2. 
+
+```{r candidateGenes}
+hits <- filter(fitPCs[["PC2"]], -log10(pval) > 10) %>% arrange(pval)
+bck <- filter(fitPCs[["PC2"]], -log10(pval) <= 10) %>% arrange(pval)
+```
+
+Gene ontology information was downloaded from biomart, and gene-set enrichment was tested for using Fisher's exact test while correcting for multiple testing correction using the method of Benjamini and Hochberg. The test used the complement of the candidate gene set (i.e. all tested genes not in the candidate set) as a background.
+
+```{r gseaTest}
+data("biomart")
+rmDot <- function(x) sapply(x, function(x) strsplit(x, "\\.")[[1]][1])
+testGenes <- rmDot(hits$gene)
+allGenes <- c(rmDot(bck$gene), testGenes)
+gsea <- iQTLthyroidPublic:::doTestGSEA(bm, testGenes, allGenes)
+nrow(gsea)
+gseaHits <- filter(gsea, pvalAdj < 0.01, odds > 5)
+gseaTab <- dplyr::select(gseaHits, goId, type, desc, odds, pval, pvalAdj, N)
+gseaTab$type <- gsub("biological_process", "BP", gseaTab$type)
+gseaTab$type <- gsub("cellular_component", "CC", gseaTab$type)
+head(gseaTab)
+```
+
+```{r gsea, fig.height=12}
+gseaHits$desc[gseaHits$desc == "regulation of defense response to virus by virus"] <- "regulation of defense response to virus"
+gseaHits$desc <- factor(gseaHits$desc, levels=gseaHits$desc)
+fSize=24
+ggplot(gseaHits, aes(x=desc, y=-log10(pvalAdj)))+geom_bar(stat="identity", fill="blue")+ylab(expression(paste(-log[10], "(", P[adj], "), GSEA")))+theme(axis.text.x=element_text(size=fSize, angle=90, hjust=1), axis.title.x=element_blank())
+```
+
+To test if the infiltration of T and B cells was significant also on a per-sample basis we ran our gene expression data through cibersort using the default LM22 signature gene file, which could in principle identify seven T cell types, as well as naive and  memory B cells. We hypothesized that the algorithm would successfully be able to identify immune cell types only in samples where lymphocyte infiltration was present.
+
+## CIBERSORT Analyses
+
+```{r cibersortCorrelation}
+data("ciber")
+ciber <- left_join(ciber, xh, by=c("Input.Sample"="sid"))
+ciber <- arrange(ciber, P.value)
+cellTypes <- colnames(ciber)[2:23]
+ciberSig <- filter(ciber, P.value < 0.5)
+corCiberTest <- cor.test(-log10(ciberSig$P.value), ciberSig$PC2, method="spearman")
+corCiberTest
+corLab <- paste("cor", round(corCiberTest$estimate, digits=2))
+ggplot()+geom_point(mapping=aes(-log10(P.value), PC2, col=hashimotos), data=ciberSig)+
+    geom_smooth(mapping=aes(-log10(P.value), PC2), data=ciberSig, method="lm", se=FALSE)+
+    xlab(expression(paste(-log[10], "(", P[C], "), CIBERSORT")))+
+    ylab("Image PC2")+
+    scale_color_manual(values=c("grey", "blue"))+
+    guides(col=FALSE)
+```
+
+```{r validationOfPCAapproach}
+ciberCorFt <- sapply(ftNames, function(ft) cor(-log10(ciberSig[, "P.value"]), ciberSig[, ft], method="spearman"))
+indMax <- which.max(abs(ciberCorFt))
+ciberCorFt[indMax]
+ciberCorFt <- data.frame(cor=ciberCorFt)
+ggplot(ciberCorFt, aes(abs(cor)))+geom_histogram(fill="blue", binwidth=0.02)+xlab(expression(paste("CIBERSORT correlation |", rho, "|")))+geom_vline(xintercept=corCiberTest$estimate, linetype="dashed")
+pc2loading <- pca$rotation[, "PC2"]
+pc2loading <- pc2loading[order(abs(pc2loading), decreasing=TRUE)]
+df.loading <- data.frame(feature=names(pc2loading), loading=unname(pc2loading))
+head(df.loading)
+```
+
+To obtain an overview of the most abundant immune cell types, we generated a heatmap showing cibersort frequencies above 5 percent.
+
+```{r cibersortHeatmap, fig.height=3.5, fig.width=12}
+ciberSigSig <- filter(ciberSig, P.value < 0.1)
+Mc <- as.matrix(ciberSigSig[, cellTypes])
+rownames(Mc) <- ciberSigSig$Input.Sample
+cellTypeFreq <- apply(Mc, 2, mean)
+Mc <- Mc[, order(cellTypeFreq, decreasing=TRUE)]
+Mc <- Mc[, names(cellTypeFreq[cellTypeFreq > 0.05])]
+fSize=24
+colnames(Mc) <- gsub("\\.", " ", colnames(Mc))
+Heatmap(t(Mc), col= colorRampPalette( c("blue", "yellow"))(256), heatmap_legend_param=list(title="frequency", title_gp=gpar(fontsize=fSize), labels_gp=gpar(fontsize=fSize), grid_height=unit(10, "mm"), grid_width=unit(10, "mm")), show_column_names=FALSE, row_names_gp=gpar(fontsize=fSize), row_names_max_width=unit(12, "cm"), column_title="GTEx thyroid samples", column_title_gp=gpar(fontsize=fSize), column_title_side="bottom")
+```
+
+## Selection of SNPs for iQTL Analysis
+
+In preparation for testing for possible associations between genotype and quantitative imaging phenotype, we intersected our imaging + gene expression data with GTEx samples for which SNP array data was available. This reduced our sample size to N=291. 
+
+We hypothesized that the genotype of expressed coding genes in the invading lymphocytes might play a key role in the observed immune response. We therefore performed a differential expression analysis between Hashimoto Thyroiditis cases and non-cases, as defined by GTEx pathology notes.
+
+```{r DESeqAbundance}
+data("DESeqRes")
+ggplot(DESeqRes, aes(log2(baseMean), log2FoldChange, col=-log10(padj) > 7))+geom_point(alpha=0.5)+scale_color_manual(values=c("grey", "red"))+guides(col=FALSE)+ylab(expression(paste(log[2], "(FC), cases/controls")))+xlab(expression(paste(log[2], "(expression)")))
+```
+
+```{r volcano}
+beta0 <- 0.5
+vol <- DESeqRes
+vol$col <- "grey"
+vol$col[vol$log2FoldChange > beta0 & -log10(vol$padj) > 7] <- "blue"
+ggplot(vol, aes(log2FoldChange, -log10(padj), col=col))+geom_point(alpha=0.3)+
+    xlab(expression(paste(log[2], "(FC), cases/controls")))+
+    ylab(expression(paste(-log[10], , "(", P[adj], "), DESeq2")))+
+    guides(col=FALSE)+scale_color_manual(values=c("blue", "grey"))
+sig <- filter(DESeqRes, -log10(padj) > 7, log2FoldChange > beta0) %>% arrange(padj)
+nrow(sig)
+```
+
+After filtering out variants with a minor allele frequency less than 10 percent, and SNPs with a missing call rate of more than 10 percent, this left 100,215 candidate SNPs for testing.
+
+## iQTL Regression Results
+
+Image QTL fits were performed using the MatrixEQTL package while treating PC2 as a pseudo trans gene, and correcting for gender, age, collection site, tissue autolysis score, and ancestry (by including the first three principal components of the genotype matrix for all 450 GTEx samples). P-values from all fits were returned.
+
+A QQ plot of the QTL fits showed that the data is well behaved under the null hypothesis, with data lying mostly along the diagonal, and, desirably a small number of SNPs showed positive signal.
+
+```{r iQTL}
+data("iQTLfits")
+expLab <- expression(paste(-log[10], "(", P, "), iQTL expected"))
+obsLab <- expression(paste(-log[10], "(", P, "), iQTL observed"))
+meImg$all$eqtls$rankN <- rank(meImg$all$eqtls$pvalue)/nrow(meImg$all$eqtls)
+ggplot(meImg$all$eqtls, aes(-log10(rankN), -log10(pvalue)))+geom_point(col="blue")+geom_abline(slope=1, intercept=0, linetype="dashed")+xlab(expLab)+ylab(obsLab)
+```
+
+## Correction for Multiple Testing
+
+To increase our power to detect significant QTLs as compared to the method of Benjamini and Hochberg, we used the recently developed method of Independent Hypothesis Weighting, using minor allele frequency as the covariate. In a data-driven manner, this approach placed higher weights on SNPs with a high minor allele frequency, and lower weights on SNPs with a low minor allele frequency.
+
+```{r IHW}
+data("maf")
+df <- data.frame(pval=meImg$all$min.pv.snp)
+df$snp <- rownames(df)
+df$maf <- maf[rownames(df)]
+ihwFit <- ihw(pval~maf, df, alpha=0.05, nbins=20)
+p <- plot(ihwFit)
+p+xlab("minor allele frequency bin")+theme(legend.position=c(0.1, 0.8))
+df$p.adj <- adj_pvalues(ihwFit)
+df <- arrange(df, p.adj, pval)
+df <- left_join(df, meImg$all$eqtls, by=c("snp"="snps"))
+dfHits <- filter(df, p.adj < 0.05)
+print(dfHits, digits=3)
+dfHitsTXNDC5 <- filter(df, p.adj < 0.5, grepl("^6_[78]", snp))
+```
+
+The significant SNPs were all found in histone deacetylase 9 (HDAC9). To assess the linkage disequilibrium structure of the results, we used plink to recover haplotype information using the full set of 450 GTEx samples (maximum block size 5 kb).
+
+```{r haplotypeBlocks}
+data("hap")
+dfHits <- left_join(dfHits, hap, by=c("snp"="SNP"))
+table(dfHits$block)
+tabHits <- dfHits
+tabHits$hap <- paste0("hap", as.integer(factor(tabHits$block, levels=unique(tabHits$block))))
+colnames(tabHits)[colnames(tabHits) == "RS_ID_dbSNP142_CHG37p13"] <- "rsid"
+f <- function(x, n) {
+    s <- sapply(x, function(y) {
+        strsplit(y, split="_")[[1]][n]
+    })
+    as.vector(s)
+}
+tabHits$ref <- f(tabHits$snp, 3)
+tabHits$alt <- f(tabHits$snp, 4)
+tabHits$rsid <- paste0(tabHits$rsid, "(", tabHits$ref, ">", tabHits$alt, ")")
+tabHits$coordinates <- paste0("Chr", f(tabHits$snp, 1), ":", f(tabHits$snp, 2))
+tabHits$gene <- NA_character_
+tabHits$gene[grepl("^Chr7", tabHits$coordinates)] <- "HDAC9"
+tabHits$gene[grepl("^Chr6", tabHits$coordinates)] <- "TXNDC5"
+colnames(tabHits)[colnames(tabHits) == "p.adj"] <- "p.ihw"
+tabHits <- dplyr::select(tabHits, rsid, coordinates, gene, p.ihw, FDR, pvalue, beta, maf, hap)
+print(tabHits, digits=2)
+dfBlockHits <- dfHits %>% group_by(block) %>% slice(which.min(pval)) %>% ungroup %>% arrange(p.adj) %>% dplyr::select(pval, snp, maf, p.adj, RS_ID_dbSNP142_CHG37p13)
+dfBlockHits
+```
+
+## Gene Expression QTL Comparison
+
+We compared the performance of the iQTL fits to equivalent fits with expression PEER factor 1.
+
+```{r peerQTL}
+data("peerQTLfits")
+expLabPeer <- expression(paste(-log[10], "(", P, "), PEER1 QTL expected"))
+obsLabPeer <- expression(paste(-log[10], "(", P, "), PEER1 QTL observed"))
+mePeer$all$eqtls$rankN <- rank(mePeer$all$eqtls$pvalue)/nrow(mePeer$all$eqtls)
+ggplot(mePeer$all$eqtls, aes(-log10(rankN), -log10(pvalue)))+geom_point(col="blue")+geom_abline(slope=1, intercept=0, linetype="dashed")+xlab(expLabPeer)+ylab(obsLabPeer)
+```
+
+## Testing of top iQTLs
+
+```{r grange}
+grange <- list(
+    chr7.HDAC9=c(18126572, 19042039), #ENSG00000048052.17
+    chr6.TXNDC5=c(7881483, 8026646) #ENSG00000239264.4
+)
+```
+
+```{r HDACposition, fig.height=8}
+df$chr <- f(df$snp, 1)
+df$pos <- as.integer(f(df$snp, 2))
+h9range <- grange[["chr7.HDAC9"]] 
+peakHDAC9 <- 18301455 #18313167
+dfHDAC9 <- filter(df, chr == "7", pos >= h9range[1], pos <= h9range[2])
+data("fitsHDAC9_withPCs")
+fitsHDAC9 <- fits
+dfEmergeHDAC9 <- data.frame(pos=as.integer(names(fits)), pval=sapply(fits, function(x) x[4]), beta=sapply(fits, function(x) x[1]))
+
+chooseCommonSNPs <- function(dfGTEx, dfEmerge) {
+    posCommon <- intersect(dfGTEx$pos, dfEmerge$pos)
+    print(length(posCommon))
+    dfEmerge <- filter(dfEmerge, pos %in% posCommon)
+    dfGTEx <- filter(dfGTEx, pos %in% posCommon)
+    return(list(GTEx=dfGTEx, eMERGE=dfEmerge))
+}
+
+plotTogether <- function(dfGTEx, dfEmerge, chr=6, gr, peak, rangeGTEx, rangeEmerge) {
+    dfEmerge <- dplyr::select(dfEmerge, pos, pval, beta)
+    dfGTEx <- dplyr::select(dfGTEx, pos, pvalue, beta)
+    colnames(dfGTEx) <- colnames(dfEmerge)
+    dfEmerge$dataset <- "eMERGE"
+    dfGTEx$dataset <- "GTEx"
+    dfPlot <- rbind(dfGTEx, dfEmerge)
+    dfPlot$dataset <- factor(dfPlot$dataset, levels=c("GTEx", "eMERGE"))
+    ggplot(dfPlot, aes(pos/1000, -log10(pval)))+geom_point()+xlab(paste0("Chromosome ", chr, " position (kb)"))+ylab(expression(paste(-log[10], "(", P, ")")))+facet_wrap(~dataset, ncol=1, scales="free")+xlim(gr/1000)+geom_vline(xintercept=peak/1000, col="blue", lwd=2, alpha=0.4)
+}
+
+commonHDAC9 <- chooseCommonSNPs(dfHDAC9, dfEmergeHDAC9)
+dfHDAC9 <- commonHDAC9$GTEx
+dfEmergeHDAC9 <- commonHDAC9$eMERGE
+plotTogether(dfHDAC9, dfEmergeHDAC9, chr=7, gr=grange[["chr7.HDAC9"]], peak=peakHDAC9)+geom_segment(x=18950, xend=19000, y=4.7, yend=4.7, col="darkgreen", lwd=2)
+```
+
+```{r TXNDC5position, fig.height=8}
+dfTXNDC5 <- filter(df, chr == "6", pos >= grange[["chr6.TXNDC5"]][1], pos <= grange[["chr6.TXNDC5"]][2])
+peakTXNDC5 <- 7886905
+data("fitsTXNDC5_withPCs")
+fitsTXNDC5 <- fits
+dfEmergeTXNDC5 <- data.frame(pos=as.integer(names(fits)), pval=sapply(fits, function(x) x[4]), beta=sapply(fits, function(x) x[1]))
+commonTXNDC5 <- chooseCommonSNPs(dfTXNDC5, dfEmergeTXNDC5)
+dfTXNDC50 <- dfTXNDC5 # for GTEx eQTL comparison
+dfTXNDC5 <- commonTXNDC5$GTEx
+dfEmergeTXNDC5 <- commonTXNDC5$eMERGE
+plotTogether(dfTXNDC5, dfEmergeTXNDC5, chr=6, gr=grange[["chr6.TXNDC5"]], peak=peakTXNDC5)+geom_segment(x=7975, xend=8025, y=4, yend=4, lwd=2, col="darkgreen")
+```
+
+## TXNDC5 eQTL Overlap with iQTLs
+
+```{r TXNDC5eqtl}
+data("eqtlsTXNDC5")
+eqtlsTXNDC5 <- filter(eqtlsTXNDC5, Variant.Id %in% dfTXNDC50$snp)
+nrow(eqtlsTXNDC5)
+eqtlsTXNDC5$pos <- f(eqtlsTXNDC5$Variant.Id, 2) %>% as.integer
+eqtlsTXNDC5$isIqtl <- eqtlsTXNDC5$Variant.Id %in% filter(dfHitsTXNDC5, p.adj < 0.5)$snp
+eqtlsTXNDC5 <- left_join(eqtlsTXNDC5, hap, by=c("Variant.Id"="SNP"))
+isNA <- is.na(eqtlsTXNDC5$block)
+eqtlsTXNDC5$block[isNA] <- eqtlsTXNDC5$Variant.Id[isNA]
+eqtlsTXNDC5$hap <- paste0("hap", as.integer(factor(eqtlsTXNDC5$block, levels=unique(eqtlsTXNDC5$block))))
+eqtlsTXNDC5 <- eqtlsTXNDC5 %>% group_by(hap) %>% mutate(isLDiqtl=rep(as.logical(max(isIqtl)), length(isIqtl))) %>% ungroup
+eqtlsTXNDC5 %>% dplyr::select(Variant.Id, P.Value, hap, isIqtl, isLDiqtl) %>% arrange(P.Value) %>% print.data.frame
+
+
+ggplot(eqtlsTXNDC5, aes(pos/1000, -log10(P.Value), col=isLDiqtl))+geom_point()+
+    geom_vline(xintercept=peakTXNDC5/1000, col="blue", lwd=2, alpha=0.4)+
+    xlab(paste0("Chromosome 6 position (kb)"))+ylab(expression(paste(-log[10], "(", P, "), GTEx eQTL")))+xlim(grange[["chr6.TXNDC5"]]/1000)+scale_color_manual(values=c("grey", "red"))+guides(col=FALSE)
+table(eqtlsTXNDC5$isIqtl)
+table(eqtlsTXNDC5$isLDiqtl)
+
+dfHitsTXNDC5qtlAll <- left_join(dfHitsTXNDC5, eqtlsTXNDC5, by=c("snp"="Variant.Id")) 
+dfHitsTXNDC5qtlAll$ref <- f(dfHitsTXNDC5qtlAll$snp, 3)
+dfHitsTXNDC5qtlAll$alt <- f(dfHitsTXNDC5qtlAll$snp, 4)
+dfHitsTXNDC5qtlAll$rsid <- paste0(dfHitsTXNDC5qtlAll$RS_ID_dbSNP142_CHG37p13, "(", dfHitsTXNDC5qtlAll$ref, ">", dfHitsTXNDC5qtlAll$alt, ")")
+dfHitsTXNDC5qtlAll$coordinates <- paste0("Chr", f(dfHitsTXNDC5qtlAll$snp, 1), ":", f(dfHitsTXNDC5qtlAll$snp, 2))
+dfHitsTXNDC5qtlAll <- dfHitsTXNDC5qtlAll %>% dplyr::select(rsid, coordinates, Gene.Symbol, p.adj, FDR, pval, beta, maf, P.Value, Effect.Size)
+dfHitsTXNDC5qtlAll$Gene.Symbol <- "TXNDC5"
+colnames(dfHitsTXNDC5qtlAll) <- c("rsid", "GRCh37/hg19 Coordinates", "Gene", "P_IHW_iQTL", "FDR_iQTL", "P_iQTL",  "Beta_iQTL", "MAF", "P_eQTL", "Beta_eQTL")
+print(dfHitsTXNDC5qtlAll, digits=2)
+```
+
+## SNP Binning and Perumtation Testing
+
+```{r pvalueStructureComparison}
+binP <- function(df1, df2, n=15, suffix=c(".df1", ".df2")) {
+    df1 <- arrange(df1, pos)
+    df2 <- arrange(df2, pos)
+    posCommon <- intersect(df1$pos, df2$pos)
+    df1 <- filter(df1, pos %in% posCommon)
+    df2 <- filter(df2, pos %in% posCommon)
+    dim(df2); dim(df1)
+    cutPoints <- df2$pos[seq.int(1, length(df2$pos), by=n)]
+    df1$posBin <- cut(df1$pos, breaks=cutPoints)
+    df2$posBin <- cut(df2$pos, breaks=cutPoints)
+    df1Min <- df1 %>%  group_by(posBin) %>% slice(which.min(pval)) %>% ungroup
+    df2Min <- df2  %>%  group_by(posBin) %>% slice(which.min(pval)) %>% ungroup
+    df <- left_join(df1Min, df2Min, by=c("posBin"="posBin"), suffix=suffix)
+    return(df)
+}
+
+binWidth <- 20
+df <- binP(dfHDAC9, dfEmergeHDAC9, n=binWidth, suffix=c(".GTEx", ".eMERGE"))
+corT <- cor.test(-log10(df$pval.GTEx), -log10(df$pval.eMERGE), method="spearman")
+corT
+ggplot(df, aes(-log10(pval.GTEx), -log10(pval.eMERGE)))+geom_point()+xlab(expression(paste(-log[10], "(", P, "), GTEx")))+ylab(expression(paste(-log[10], "(", P, "), eMERGE")))+geom_smooth(method="lm", se=FALSE)
+df2 <- binP(dfTXNDC5, dfEmergeTXNDC5, n=binWidth, suffix=c(".GTEx", ".eMERGE"))
+corT2 <- cor.test(-log10(df2$pval.GTEx), -log10(df2$pval.eMERGE), method="spearman")
+corT2
+ggplot(df2, aes(-log10(pval.GTEx), -log10(pval.eMERGE)))+geom_point()+xlab(expression(paste(-log[10], "(", P, "), GTEx")))+ylab(expression(paste(-log[10], "(", P, "), eMERGE")))+geom_smooth(method="lm", se=FALSE)
+```
+
+```{r permutationTestHDAC9}
+data("fitPermHDAC9")
+dfPermBin <- lapply(fitPerm, function(df) binP(dfHDAC9, df, n=binWidth, suffix=c(".GTEx", ".eMERGEperm")))
+dfPermCor <- lapply(dfPermBin, function(df) cor.test(-log10(df$pval.GTEx), -log10(df$pval.eMERGEperm), method="spearman"))
+permCor <- sapply(dfPermCor, function(x) x$estimate)
+ggplot(data.frame(cor=permCor), aes(x=cor))+geom_histogram(fill="blue", binwidth=0.05)+geom_vline(xintercept=corT$estimate, linetype="dashed", col="black", lwd=1.5)+xlab(expression(paste("Spearman correlation ", rho)))+ylab("Number of permutations")
+print((sum(permCor > corT$estimate)+1)/length(permCor))
+```
+
+```{r permutationTestTXNDC5}
+data("fitPermTXNDC5")
+dfPermBin <- lapply(fitPerm, function(df) binP(dfTXNDC5, df, n=binWidth, suffix=c(".GTEx", ".eMERGEperm")))
+dfPermCor <- lapply(dfPermBin, function(df) cor.test(-log10(df$pval.GTEx), -log10(df$pval.eMERGEperm), method="spearman"))
+permCor <- sapply(dfPermCor, function(x) x$estimate)
+ggplot(data.frame(cor=permCor), aes(x=cor))+geom_histogram(fill="blue", binwidth=0.05)+geom_vline(xintercept=corT2$estimate, linetype="dashed", col="black", lwd=1.5)+xlab(expression(paste("Spearman correlation ", rho)))+ylab("Number of permutations")
+print((sum(permCor > corT2$estimate)+1)/length(permCor))
+```
+
+Generate QQ plots.
+
+```{r qqEmerge}
+dfEmergeHDAC9 <- addRankN(dfEmergeHDAC9)
+dfEmergeTXNDC5 <- addRankN(dfEmergeTXNDC5)
+expLabEmerge <- expression(paste(-log[10], "(", P, "), QTL expected"))
+obsLabEmerge <- expression(paste(-log[10], "(", P, "), QTL observed"))
+ggplot(dfEmergeHDAC9, aes(-log10(rankN), -log10(pval)))+geom_point(col="blue")+geom_abline(slope=1, intercept=0, linetype="dashed")+xlab(expLabEmerge)+ylab(obsLabEmerge)
+ggplot(dfEmergeTXNDC5, aes(-log10(rankN), -log10(pval)))+geom_point(col="blue")+geom_abline(slope=1, intercept=0, linetype="dashed")+xlab(expLabEmerge)+ylab(obsLabEmerge)
+```
+
+## Retesting on LD-Pruned Data
+
+Subset by pruned SNPs.
+
+```{r pruneLD}
+pruned <- read.table(system.file("ext/plink.prune.in", package="iQTLthyroidPublic"))
+pruned <- as.vector(pruned$V1)
+dfTXNDC5p <- filter(dfTXNDC5, RS_ID_dbSNP142_CHG37p13 %in% pruned)
+binWidthTXNDC5 <- round(binWidth/(nrow(dfTXNDC5)/ nrow(dfTXNDC5p)))
+dfEmergeTXNDC5p <- filter(dfEmergeTXNDC5, pos %in% dfTXNDC5p$pos)
+dfHDAC9p <- filter(dfHDAC9, RS_ID_dbSNP142_CHG37p13 %in% pruned)
+nrow(dfHDAC9)
+nrow(dfHDAC9p)
+binWidthHDAC9 <- round(binWidth/(nrow(dfHDAC9)/ nrow(dfHDAC9p)))
+dfEmergeTXNDC5p <- filter(dfEmergeTXNDC5, pos %in% dfTXNDC5p$pos)
+dfEmergeHDAC9p <- filter(dfEmergeHDAC9, pos %in% dfHDAC9p$pos)
+nrow(dfTXNDC5)
+nrow(dfTXNDC5p)
+
+dfEmergeHDAC9p <- addRankN(dfEmergeHDAC9p)
+dfEmergeTXNDC5p <- addRankN(dfEmergeTXNDC5p)
+ggplot(dfEmergeHDAC9p, aes(-log10(rankN), -log10(pval)))+geom_point(col="blue")+geom_abline(slope=1, intercept=0, linetype="dashed")+xlab(expLabEmerge)+ylab(obsLabEmerge)
+ggplot(dfEmergeTXNDC5p, aes(-log10(rankN), -log10(pval)))+geom_point(col="blue")+geom_abline(slope=1, intercept=0, linetype="dashed")+xlab(expLabEmerge)+ylab(obsLabEmerge)
+		     
+dfp <- binP(dfHDAC9p, dfEmergeHDAC9p, n=binWidthHDAC9, suffix=c(".GTEx", ".eMERGE"))
+corT <- cor.test(-log10(dfp$pval.GTEx), -log10(dfp$pval.eMERGE), method="spearman")
+corT
+print(paste(binWidthHDAC9, corT$estimate))
+ggplot(dfp, aes(-log10(pval.GTEx), -log10(pval.eMERGE)))+geom_point()+xlab(expression(paste(-log[10], "(", P, "), GTEx")))+ylab(expression(paste(-log[10], "(", P, "), eMERGE")))+geom_smooth(method="lm", se=FALSE)
+
+data("fitPermHDAC9")
+dfPermBin <- lapply(fitPerm, function(df) binP(dfHDAC9p, df, n=binWidthHDAC9, suffix=c(".GTEx", ".eMERGEperm")))
+dfPermCor <- lapply(dfPermBin, function(df) cor.test(-log10(df$pval.GTEx), -log10(df$pval.eMERGEperm), method="spearman"))
+permCor <- sapply(dfPermCor, function(x) x$estimate)
+ggplot(data.frame(cor=permCor), aes(x=cor))+geom_histogram(fill="blue", binwidth=0.05)+geom_vline(xintercept=corT$estimate, linetype="dashed", col="black", lwd=1.5)+xlab(expression(paste("Spearman correlation ", rho)))+ylab("Number of permutations")
+print((sum(permCor > corT$estimate)+1)/length(permCor))
+
+df2p <- binP(dfTXNDC5p, dfEmergeTXNDC5p, n=binWidthTXNDC5, suffix=c(".GTEx", ".eMERGE"))
+corT2 <- cor.test(-log10(df2p$pval.GTEx), -log10(df2p$pval.eMERGE), method="spearman")
+corT2
+print(paste(binWidthTXNDC5, corT2$estimate))
+ggplot(df2p, aes(-log10(pval.GTEx), -log10(pval.eMERGE)))+geom_point()+xlab(expression(paste(-log[10], "(", P, "), GTEx")))+ylab(expression(paste(-log[10], "(", P, "), eMERGE")))+geom_smooth(method="lm", se=FALSE)
+
+data("fitPermTXNDC5")
+dfPermBin <- lapply(fitPerm, function(df) binP(dfTXNDC5p, df, n=binWidthTXNDC5, suffix=c(".GTEx", ".eMERGEperm")))
+dfPermCor <- lapply(dfPermBin, function(df) cor.test(-log10(df$pval.GTEx), -log10(df$pval.eMERGEperm), method="spearman"))
+permCor <- sapply(dfPermCor, function(x) x$estimate)
+ggplot(data.frame(cor=permCor), aes(x=cor))+geom_histogram(fill="blue", binwidth=0.05)+geom_vline(xintercept=corT2$estimate, linetype="dashed", col="black", lwd=1.5)+xlab(expression(paste("Spearman correlation ", rho)))+ylab("Number of permutations")
+print((sum(permCor > corT2$estimate)+1)/length(permCor))
+```
+
+## Session Information
+
+```{r sessionInfo}
+sessionInfo()
+```

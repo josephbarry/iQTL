@@ -1,0 +1,113 @@
+---
+title: "Example image segmentation"
+author: "Joseph Barry"
+output: 
+    html_document:
+        toc: true
+        theme: united
+---
+<!--
+%\VignetteEngine{knitr::rmarkdown}
+%\VignetteIndexEntry{Supplementary Materials - segmentation}
+-->
+
+```{r setup, include=FALSE}
+library(knitr)
+opts_chunk$set(fig.path="fig/", warning=FALSE, fig.align="center", fig.show="hold", fig.width=6, fig.height=6, message=FALSE, out.extra='style=""', dpi=300, fig.ext='pdf', dev='pdf')
+```
+
+
+```{r load}
+library(iQTLthyroidPublic)
+library(EBImage)
+library(ggplot2)
+theme_set(theme_classic(base_size=24))
+```
+
+## Example Segmentation
+
+For this example segmentation we will process the image displayed in Figure 1A.
+
+```{r readImage}
+img <- readImage(system.file("ext/GTEX-11NV4.jpeg", package="iQTLthyroidPublic"))
+```
+
+To segment tissue pieces, the color channels were first averaged, and then adaptive thresholding was used to distinguish tissue from background. The channel-averaged data was not used for subsequent feature extraction steps; for that purpose the individual color channels were treated separately.
+
+```{r segmentTissuePieces}
+L <- 101
+L.piece <- 1001
+threshOffset <- 0.01
+P.min <- 1e5
+mk2 <- makeBrush(L, "gaussian", sigma=L/2)
+mk2 <- mk2/sum(mk2)
+img2 <- (img[, , 1]+img[, , 2]+img[, , 3])/3
+colorMode(img2) <- Grayscale
+img2 <- filter2(img2, mk2)
+pieces <- thresh(1-img2, w=L.piece, h=L.piece, offset=threshOffset)
+pieces <- fillHull(pieces)
+pieces.bw <- bwlabel(pieces)
+ftsPieces <- computeFeatures.shape(pieces.bw)
+indRmPieces <- as.integer(rownames(ftsPieces)[ftsPieces[, "s.area"] < P.min])
+pieces.bw <- rmObjects(pieces.bw, indRmPieces)
+pieces.bw <- reenumerate(pieces.bw)
+```
+
+Gaussian blurring was performed to smooth out pixel-level variation on a length scale smaller than the invading lympocytes.
+
+```{r gaussisanBlur}
+L2 <- 51
+mk <- makeBrush(L2, shape="gaussian", sigma=L2/2)
+mk <- mk/sum(mk)
+img2 <- filter2(img, mk)
+```
+
+Haralick feature extraction was then performed across 3 Haralick scales and each of the RGB channels.
+
+```{r ftExtract}
+fts <- iQTLthyroidPublic:::getCellFtrsThyroid(img2, pieces.bw, scales=c(1, 10, 100))
+```
+
+Compare to pre-saved feature table. Note that as software versions update over time the results will not be identical to those found in the presaved feature table. We use the median normalized difference in features to demonstrate the reproducibility of the feature values.
+
+```{r checkReproducibility}
+data("featTable")
+ind <- which(ft[, "PlateName"] == "GTEX-11NV4")
+ftPaper <- ft[ind, 7:ncol(ft)]
+ftDiff <- unlist((fts[, colnames(ftPaper)] - ftPaper)/ftPaper)
+median(ftDiff)
+```
+
+## Computation of Local Image PC2
+
+Break up the image into tiled objects and recompute local Haralick features for each tile. Local Image PC2 recomputed as described in the main text.
+
+```{r mapFtToImage}
+data("pc2loading")
+data("ftStats")
+all(names(ft.mean) == names(ft.sd))
+
+tile <- iQTLthyroidPublic:::genPC2Tile(img2, L=250, ft.mean=ft.mean, ft.sd=ft.sd, loadings=pc2loading)
+```
+
+We found the median pixel value to give a robust measure of background across samples.
+
+```{r bckSubtract}
+m <- median(tile)
+hist(m, breaks=50, col="blue")
+abline(v=m)
+tile[tile < m] <- m
+```
+Image brightness is rescaled for visualization purposes.
+
+```{r normalizedSegmentation}
+tileNorm <- normalize(tile)
+display(tileNorm, display="raster")
+```
+
+## Session Information
+
+```{r sessionInfo}
+sessionInfo()
+```
+

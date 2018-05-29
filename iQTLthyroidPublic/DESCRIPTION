@@ -1,0 +1,11 @@
+Package: iQTLthyroidPublic
+Type: Package
+Title: iQTLthyroidPublic
+Version: 0.0.2
+Author: Joseph Barry
+Maintainer: Joseph Barry <josephbarry.mail@gmail.com>
+Depends: dplyr
+Suggests: ggplot2, MatrixEQTL, gtools, EBImage, ComplexHeatmap, knitr, ROCR, IHW
+VignetteBuilder: knitr
+Description: Data and figures for associated paper.
+License: MIT
